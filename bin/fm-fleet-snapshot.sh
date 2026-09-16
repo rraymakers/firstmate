@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # fm-fleet-snapshot.sh - structured fleet snapshot with observational caching.
 #
-# Output contract: `--json` prints one object with schema
+# Output contract: `--json` and `--json-read-only` print one object with schema
 # `fm-fleet-snapshot.v1`.
 # The command does not acquire the session lock, drain wakes, arm watchers,
 # mutate backlog state, or write reports. Its default ledger collector may
@@ -22,7 +22,8 @@
 #     hold_reason, and hold_until when tasks-axi emits it. They also carry
 #     normalized current_role, requires_child_metadata, blocked_by_ids,
 #     unresolved_blocker_ids, captain_actionable, hold_set, hold_age_days,
-#     and hold_bucket fields.
+#     hold_bucket, and report_present fields. report_present is true only when
+#     the canonical data/<id>/report.md path is recorded and exists at capture.
 #     Repeated blocker tokens remain ordered; a blocker resolves only when its
 #     structured record is Done, and missing ids stay open.
 #     There is no separate decision type: any captain-held task is the same
@@ -51,6 +52,9 @@
 #     generation changes while observations run, its selected metadata remains
 #     but mutable current-state, status, report, and endpoint evidence is discarded
 #     rather than attributed to the replacement generation.
+#     started_at is the canonical UTC start timestamp recorded by new spawns;
+#     legacy metadata carries null and views must not infer a start from
+#     spawn_gen or filesystem timestamps.
 #     Local current_state is parsed from bin/fm-crew-state.sh <id> and preserves
 #     state, source, detail, and raw line separately. Remote secondmate rows use
 #     an explicit unknown value because their endpoint liveness belongs to
@@ -77,14 +81,21 @@
 #     each home with explicit provenance, freshness, endpoint evidence, and unknown
 #     failure reasons. Parent status and bounded terminal evidence are historical,
 #     untrusted supplements only and never override readable structured-home facts.
-#     Each structured-home record carries active_children, decisions_open, holds,
-#     queued, landed, endpoints, counts, and omitted. provenance.summary_source
+#     Each structured-home record carries active_children for working children and
+#     endpoints for every bounded child. Both surfaces include canonical child
+#     spawn_gen identity and started_at timing when available, so parked, paused,
+#     and blocked children retain identity without being classified as active work.
+#     The record also carries decisions_open, holds, queued, landed, counts, and
+#     omitted. provenance.summary_source
 #     distinguishes "local-ledger", "remote-ledger", and "remote-ledger-cache";
 #     freshness is "cached" only for the cache source, and observed_at/age_seconds
 #     come from the selected summary's generation. Every successfully sampled home also carries
 #     reconcile_inventory independently of projection trust.
 #     Actionable captain holds appear in decisions_open; every captain hold remains
 #     in the bounded queued inventory with its structured classification metadata.
+#     Current queued and landed rows also carry bounded report_path plus
+#     report_present evidence established by the source home at capture; a missing
+#     or non-true report_present value is unproven and must fail closed downstream.
 #     Before that queued bound is applied, non-captain-actionable rows are selected
 #     ahead of captain-actionable rows so separately projected live decisions cannot
 #     crowd Charted-Next-eligible work out of the summary. Each group is ordered by
@@ -221,11 +232,14 @@ esac
 usage() {
   cat <<'EOF'
 usage: fm-fleet-snapshot.sh --json
+       fm-fleet-snapshot.sh --json-read-only
        fm-fleet-snapshot.sh --secondmate-home-summary
 
 Print a structured snapshot of the firstmate fleet.
 JSON is the stable machine-readable output contract. The default snapshot
 refreshes only its parent-side remote-summary cache as an observational side effect.
+--json-read-only may consume an existing valid remote-summary cache but never
+contacts a remote home, prepares a remote job, or creates or refreshes the cache.
 
 --secondmate-home-summary emits the bounded structured summary used after a
 validated registered-home handoff. It is local-only, skips nested secondmate
@@ -272,8 +286,10 @@ EOF
 }
 
 OUTPUT_MODE=json
+SNAPSHOT_CACHE_WRITABLE=1
 case "${1:---json}" in
   --json) ;;
+  --json-read-only) SNAPSHOT_CACHE_WRITABLE=0 ;;
   --secondmate-home-summary) OUTPUT_MODE=secondmate-home-summary ;;
   -h|--help) usage; exit 0 ;;
   *) usage >&2; exit 2 ;;
@@ -361,14 +377,14 @@ first_pr_url_in_file() {  # <file>
 }
 
 backlog_json() {  # [<backlog-path>] - defaults to this home's $BACKLOG
-  local backlog=${1:-$BACKLOG}
+  local backlog=${1:-$BACKLOG} parsed availability_file order id report_path present rc
   if [ ! -f "$backlog" ]; then
     jq -n --arg path "$backlog" '{path:$path,present:false,records:[]}'
     return 0
   fi
 
   # shellcheck disable=SC2094
-  jq -Rn --arg path "$backlog" --arg today "$SNAPSHOT_TODAY" --arg now "$SNAPSHOT_NOW" \
+  parsed=$(jq -Rn --arg path "$backlog" --arg today "$SNAPSHOT_TODAY" --arg now "$SNAPSHOT_NOW" \
     --argjson age_days "$FM_SNAPSHOT_UNDATED_HOLD_AGE_DAYS" '
     def trim: gsub("^[[:space:]]+|[[:space:]]+$"; "");
     def timestamp_epoch($d):
@@ -549,7 +565,36 @@ backlog_json() {  # [<backlog-path>] - defaults to this home's $BACKLOG
           | .captain_actionable = (.hold_bucket == "live")
         else . end)
     | del(.section,.order)
-  ' < "$backlog"
+  ' < "$backlog") || return 1
+
+  availability_file=$(mktemp "${TMPDIR:-/tmp}/fm-fleet-backlog-reports.XXXXXX") || return 1
+  while IFS=$'\t' read -r order id report_path; do
+    present=false
+    case "$id" in
+      ''|.*|*[!A-Za-z0-9._-]*) ;;
+      *)
+        if [ "$report_path" = "data/$id/report.md" ] && [ -f "$DATA/$id/report.md" ]; then
+          present=true
+        fi
+        ;;
+    esac
+    jq -cn --argjson order "$order" --argjson present "$present" '{order:$order,present:$present}' \
+      >> "$availability_file" || {
+        rm -f -- "$availability_file"
+        return 1
+      }
+  done < <(printf '%s\n' "$parsed" | jq -r '.records[] | select(.structured) | [.order, .id, (.report_path // "")] | @tsv')
+
+  printf '%s\n' "$parsed" | jq --slurpfile availability "$availability_file" '
+    .records |= map(
+      if .structured then
+        . as $record
+        | .report_present = ([ $availability[] | select(.order == $record.order) | .present ][0] // false)
+      else . end)
+  '
+  rc=$?
+  rm -f -- "$availability_file"
+  return "$rc"
 }
 
 SNAPSHOT_TASK_DIR=
@@ -719,7 +764,7 @@ prefetch_task_current_states() {
 }
 
 task_json_lines() {
-  local meta original_meta id kind harness mode yolo project worktree home projects spawn_gen backend target status_log report_path
+  local meta original_meta id kind harness mode yolo project worktree home projects spawn_gen started_at backend target status_log report_path
   local remote_host remote_root current_file endpoint_file observation_line index=0
   local pr pr_source event_json current_json endpoint_exists agent_alive meta_json status_json report_json worktree_json home_json
   local last_event_raw current_state current_source pending_decision blocked_event report_present=0 pr_from_status
@@ -740,6 +785,7 @@ task_json_lines() {
     home=$(meta_value "$meta" home)
     projects=$(meta_value "$meta" projects)
     spawn_gen=$(meta_value "$meta" spawn_gen)
+    started_at=$(meta_value "$meta" started_at)
     remote_host=$(meta_value "$meta" remote_host)
     remote_root=$(meta_value "$meta" remote_root)
     if [ -n "$remote_host" ]; then
@@ -794,7 +840,7 @@ task_json_lines() {
     open_decisions_tsv=$(status_open_decisions "$status_log")
     if [ "$kind" != secondmate ] && \
        { { { [ "$current_source" = run-step ] || [ "$current_source" = pane ]; } \
-           && [ "$current_state" != parked ] && [ "$current_state" != blocked ]; } \
+           && { [ "$current_state" = working ] || [ "$current_state" = "done" ]; }; } \
          || { [ "$current_state" = "done" ] || [ "$current_state" = "failed" ]; }; }; then
       open_decisions_tsv=""
     fi
@@ -841,6 +887,7 @@ task_json_lines() {
       --arg home "$home" \
       --arg projects "$projects" \
       --arg spawn_gen "$spawn_gen" \
+      --arg started_at "$started_at" \
       --arg backend "$backend" \
       --arg target "$target" \
       --arg remote_host "$remote_host" \
@@ -869,6 +916,7 @@ task_json_lines() {
         yolo:($yolo // ""),
         project:($project // ""),
         spawn_gen:($spawn_gen | if . == "" then null else . end),
+        started_at:($started_at | if test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$") then . else null end),
         backend:$backend,
         remote:(if $remote_host == "" then null else {host:$remote_host,root:$remote_root} end),
         paths:{
@@ -989,6 +1037,7 @@ secondmate_home_summary_json() {  # <backlog-json-file> <tasks-json-file>
             hold_kind:((.hold_kind // null) | if . == null then null else trunc(40) end),
             pr_url:((.pr_url // null) | if . == null then null else trunc(500) end),
             report_path:((.report_path // null) | if . == null then null else trunc(500) end),
+            report_present:(.report_present == true),
             local_note:((.local_note // null) | if . == null then null else trunc(120) end),completion} ]
        | sort_by([(.completion.date // ""), .id]) | reverse) as $landed_all
     | ([ $tasks[] | select(.current_state.state == "unknown") ]) as $unknown_children
@@ -1028,10 +1077,11 @@ secondmate_home_summary_json() {  # <backlog-json-file> <tasks-json-file>
          | select($work.current_role != "program")
          | $tasks[]
          | select(.id == $work.id and .current_state.state == "working")
-         | {id,kind,state:.current_state.state,
+         | {id,spawn_gen,kind,state:.current_state.state,
             repo:(($work.repo // .project // null) | if . == null then null else trunc(120) end),
             name:(($work.title // null) | if . == null then null else trunc(70) end),
             source:.current_state.source,
+            started_at:(.started_at // null),
             doing:((.current_state.detail // "") | trunc(120))} ]) as $active_all
     | ($captain_holds_all
        + ([ $tasks[] as $t | ($t.hints.open_decisions // [])[]
@@ -1098,13 +1148,22 @@ secondmate_home_summary_json() {  # <backlog-json-file> <tasks-json-file>
           captain_actionable:(.captain_actionable // false),
           repo:((.repo // null) | if . == null then null else trunc(120) end),
           kind:((.kind // null) | if . == null then null else trunc(40) end),
+          report_path:((.report_path // null) | if . == null then null else trunc(500) end),
+          report_present:(.report_present == true),
           since:((.since // null) | if . == null then null else trunc(40) end)}]
           | ((map(select(.captain_actionable != true)) | newest_filed_first)
              + (map(select(.captain_actionable == true)) | newest_filed_first))
           | .[:$queued_n]),
         landed:(if $landed_n == 0 then $landed_all else $landed_all[:$landed_n] end),
-        endpoints:([$tasks[] | {id,state:.current_state.state,source:.current_state.source,
-          endpoint:(.endpoint + {target:((.endpoint.target // null) | if . == null then null else trunc(240) end)})}][:$child_n]),
+        endpoints:([$tasks[] as $task
+          | ([$owned_in_flight[] | select(.id == $task.id)][0] // {}) as $work
+          | {id:$task.id,spawn_gen:$task.spawn_gen,kind:$task.kind,
+             state:$task.current_state.state,source:$task.current_state.source,
+             repo:(($work.repo // $task.project // null) | if . == null then null else trunc(120) end),
+             name:(($work.title // null) | if . == null then null else trunc(70) end),
+             started_at:($task.started_at // null),
+             doing:(($task.current_state.detail // "") | trunc(120)),
+             endpoint:($task.endpoint + {target:(($task.endpoint.target // null) | if . == null then null else trunc(240) end)})}][:$child_n]),
         counts:{
           active_children:($active_all | length),
           decisions_open:($decisions_all | length),
@@ -1307,6 +1366,7 @@ snapshot_cache_prepare() {
     case "$mode" in ''|*[!0-7]*) return 1 ;; esac
     [ $((8#$mode & 077)) -eq 0 ] || return 1
   else
+    [ "$SNAPSHOT_CACHE_WRITABLE" -eq 1 ] || return 1
     [ -d "$(dirname "$FM_SNAPSHOT_CACHE_DIR")" ] || return 1
     (umask 077; mkdir "$FM_SNAPSHOT_CACHE_DIR") 2>/dev/null || return 1
   fi
@@ -1331,6 +1391,7 @@ snapshot_route_cache_path() {  # <id> <host> <home>
 
 snapshot_cache_store() {  # <summary-json-file> <destination>
   local summary_file=$1 destination=$2 tmp
+  [ "$SNAPSHOT_CACHE_WRITABLE" -eq 1 ] || return 0
   [ "$SNAPSHOT_CACHE_AVAILABLE" -eq 1 ] || return 1
   case "$destination" in "$FM_SNAPSHOT_CACHE_DIR"/*) ;; *) return 1 ;; esac
   [ ! -L "$destination" ] || return 1
@@ -1356,8 +1417,17 @@ length == 1 and (.[0] |
   and (.valid | type) == "boolean" and (.state | type) == "string"
   and (.invalidity | type) == "object" and (.invalidity.ids | type) == "array"
   and (.active_children | type) == "array" and (.decisions_open | type) == "array"
+  and all(.active_children[];
+    (.spawn_gen == null or ((.spawn_gen | type) == "string" and (.spawn_gen | length) > 0))
+    and (.started_at == null or ((.started_at | type) == "string" and (try (.started_at | fromdateiso8601) catch null) != null)))
   and (.holds | type) == "array" and (.queued | type) == "array"
+  and all(.queued[];
+    (.report_path == null or ((.report_path | type) == "string" and (.report_path | length) <= 500))
+    and (.report_present == null or (.report_present | type) == "boolean"))
   and (.landed | type) == "array" and (.endpoints | type) == "array"
+  and all(.endpoints[];
+    (.spawn_gen == null or ((.spawn_gen | type) == "string" and (.spawn_gen | length) > 0))
+    and (.started_at == null or ((.started_at | type) == "string" and (try (.started_at | fromdateiso8601) catch null) != null)))
   and (.counts | type) == "object" and (.omitted | type) == "array"
 )
 JQ
@@ -1392,6 +1462,7 @@ manifest=$2
 out_dir=$3
 filter=$4
 max_bytes=$5
+cache_writable=$6
 
 valid_summary() {  # <file> <home>
   local file=$1 home=$2 bytes
@@ -1421,11 +1492,13 @@ collect_one() {  # <manifest-row>
   slot=$(printf '%s' "$row" | jq -r '.slot') || return
   fetch="$out_dir/$slot.fetch"
   status="$out_dir/$slot.status"
-  if bounded_collect "$fetch" "$out_dir/$slot.fetch.err" \
-      "$script_dir/fm-on.sh" "$id" fm-remote-file.sh get state/home-summary.json "$max_bytes" \
-      && valid_summary "$fetch" "$home"; then
-    printf 'fresh\n' > "$status"
-    return
+  if [ "$cache_writable" -eq 1 ]; then
+    if bounded_collect "$fetch" "$out_dir/$slot.fetch.err" \
+        "$script_dir/fm-on.sh" "$id" fm-remote-file.sh get state/home-summary.json "$max_bytes" \
+        && valid_summary "$fetch" "$home"; then
+      printf 'fresh\n' > "$status"
+      return
+    fi
   fi
   if [ -n "$cache" ] && valid_summary "$cache" "$home"; then
     printf 'cached\n' > "$status"
@@ -1444,7 +1517,7 @@ BASH
   SNAPSHOT_COLLECTION_TIMED_OUT=0
   if fm_run_timed "$FM_SNAPSHOT_BUDGET" bash "$collector" \
       "$SCRIPT_DIR" "$manifest" "$SNAPSHOT_COLLECT_DIR" "$SNAPSHOT_SUMMARY_FILTER" \
-      "$FM_SNAPSHOT_SECONDMATE_MAX_BYTES"; then
+      "$FM_SNAPSHOT_SECONDMATE_MAX_BYTES" "$SNAPSHOT_CACHE_WRITABLE"; then
     :
   else
     rc=$?

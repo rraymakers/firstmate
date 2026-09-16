@@ -95,6 +95,8 @@ EOF
     "kind=ship" \
     "mode=ship" \
     "yolo=off" \
+    "spawn_gen=gen-ship-fixture" \
+    "started_at=2026-07-07T12:00:00Z" \
     "pr=https://github.com/kunchenguid/firstmate/pull/9"
   printf 'needs-decision: choose an API shape\n' > "$home/state/ship-task.status"
   # A working ship task proves it through its own semantic busy-state record
@@ -152,7 +154,7 @@ test_empty_fleet_json() {
 }
 
 test_fixture_snapshot_json() {
-  local home fakebin out ids
+  local home fakebin out ids summary
   home=$(make_home fixture)
   write_fixture "$home"
   fakebin=$(make_fakebin "$home")
@@ -165,11 +167,20 @@ test_fixture_snapshot_json() {
     .tasks[] | select(.id == "ship-task")
     | .current_state.state == "working"
       and .current_state.source == "pane"
+      and .started_at == "2026-07-07T12:00:00Z"
       and .pr.url == "https://github.com/kunchenguid/firstmate/pull/9"
       and .backlog.body_excerpt == "Preserve this detail for bearings."
       and .hints.pending_decision == false
       and .paths.status_log.kind == "event_history"
   ' >/dev/null || fail "ship task state, PR, body, and stale event hints wrong"
+  printf '%s' "$out" | jq -e '
+    .tasks[] | select(.id == "scout-task") | .started_at == null
+  ' >/dev/null || fail "legacy task without started_at did not preserve unavailable timing"
+  summary=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --secondmate-home-summary)
+  printf '%s' "$summary" | jq -e '
+    .active_children[] | select(.id == "ship-task")
+    | .spawn_gen == "gen-ship-fixture" and .started_at == "2026-07-07T12:00:00Z"
+  ' >/dev/null || fail "home summary did not carry canonical child generation and start time"
   printf '%s' "$out" | jq -e '
     .tasks[] | select(.id == "scout-task")
     | .paths.report.present == true
@@ -195,6 +206,45 @@ test_fixture_snapshot_json() {
     | .state == "done" and .pr_url == "https://github.com/kunchenguid/firstmate/pull/7"
   ' >/dev/null || fail "done backlog PR row missing"
   pass "fixture snapshot covers task rows, backlog rows, pointers, and stable ordering"
+}
+
+test_home_summary_preserves_held_report_availability() {
+  local home fakebin out child_gen
+  home=$(make_home held-report-summary)
+  mkdir -p "$home/data/active-hold" "$home/projects/active-hold"
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+- [ ] active-hold - Active hold data/active-hold/report.md (repo: alpha) (kind: ship) (hold: choose route) (hold-kind: captain)
+  Captain hold set: 2026-09-14T00:00:00Z
+
+## Queued
+- [ ] missing-hold - Missing hold data/missing-hold/report.md (repo: alpha) (kind: captain) (hold: choose fallback) (hold-kind: captain)
+  Captain hold set: 2026-09-14T00:00:00Z
+
+## Done
+EOF
+  printf '# Active hold report\n' > "$home/data/active-hold/report.md"
+  fm_write_meta "$home/state/active-hold.meta" \
+    "window=firstmate:fm-active-hold" \
+    "worktree=$home/projects/active-hold" \
+    "project=alpha" \
+    "harness=claude" \
+    "kind=ship" \
+    "mode=ship"
+  child_gen=$("$ROOT/bin/fm-busy-event.sh" arm "$home/state" active-hold)
+  "$ROOT/bin/fm-busy-event.sh" apply "$home/state" active-hold busy --gen "$child_gen" \
+    --source claude-hook --event user-prompt-submit
+  fakebin=$(make_fakebin "$home")
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_SNAPSHOT_NOW=2026-09-15T12:00:00Z \
+    "$SNAPSHOT" --secondmate-home-summary)
+  printf '%s' "$out" | jq -e '
+    ([.active_children[] | select(.id == "active-hold" and .spawn_gen == null)] | length) == 1
+    and ([.queued[] | select(.id == "active-hold")][0]
+      | .report_path == "data/active-hold/report.md" and .report_present == true)
+    and ([.queued[] | select(.id == "missing-hold")][0]
+      | .report_path == "data/missing-hold/report.md" and .report_present == false)
+  ' >/dev/null || fail "home summary lost held report availability evidence: $out"
+  pass "home-summary preserves bounded held report availability evidence"
 }
 
 # R1 owner contract: main_inventory discloses orphan in-flight and unstructured
@@ -476,6 +526,62 @@ test_event_hints_follow_reconciled_current_state() {
   pass "snapshot event hints follow reconciled current state"
 }
 
+test_home_summary_preserves_nonterminal_child_generations() {
+  local home fakebin out child state child_gen
+  home=$(make_home summary-nonterminal-generations)
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+- [ ] working-child - Working child (repo: alpha) (kind: ship)
+- [ ] parked-child - Parked child (repo: alpha) (kind: ship)
+- [ ] paused-child - Paused child (repo: alpha) (kind: ship)
+- [ ] blocked-child - Blocked child (repo: alpha) (kind: ship)
+
+## Queued
+
+## Done
+EOF
+  for child in working-child parked-child paused-child blocked-child; do
+    mkdir -p "$home/projects/$child"
+    fm_write_meta "$home/state/$child.meta" \
+      "window=firstmate:fm-$child" \
+      "worktree=$home/projects/$child" \
+      "project=alpha" \
+      "harness=claude" \
+      "kind=ship" \
+      "mode=ship" \
+      "spawn_gen=gen-$child" \
+      "started_at=2026-09-15T11:00:00Z"
+  done
+  child_gen=$("$ROOT/bin/fm-busy-event.sh" arm "$home/state" working-child)
+  "$ROOT/bin/fm-busy-event.sh" apply "$home/state" working-child busy --gen "$child_gen" \
+    --source claude-hook --event user-prompt-submit
+  printf 'working: implementing\n' > "$home/state/working-child.status"
+  record_claude_idle "$home/state" parked-child
+  printf 'needs-decision [key=route]: choose a route\n' > "$home/state/parked-child.status"
+  record_claude_idle "$home/state" paused-child
+  printf 'paused: awaiting upstream\n' > "$home/state/paused-child.status"
+  record_claude_idle "$home/state" blocked-child
+  printf 'blocked: missing access\n' > "$home/state/blocked-child.status"
+  fakebin=$(make_fakebin "$home")
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --secondmate-home-summary)
+  printf '%s' "$out" | jq -e '
+    .counts.active_children == 1
+      and (.active_children | length) == 1
+      and (.active_children[0]
+        | .id == "working-child" and .spawn_gen == "gen-working-child"
+          and .state == "working" and .repo == "alpha"
+          and .started_at == "2026-09-15T11:00:00Z")
+  ' >/dev/null || fail "held child lifecycle was classified as active work: $out"
+  for state in working parked paused blocked; do
+    printf '%s' "$out" | jq -e --arg id "$state-child" --arg state "$state" '
+      .endpoints[] | select(.id == $id)
+      | .state == $state and .spawn_gen == ("gen-" + $id)
+        and .started_at == "2026-09-15T11:00:00Z"
+    ' >/dev/null || fail "$state child lost canonical generation-bearing summary evidence: $out"
+  done
+  pass "home-summary preserves nonterminal generations without misclassifying held children"
+}
+
 test_scout_reports_include_teardown_reports() {
   local home out
   home=$(make_home teardown-reports)
@@ -552,7 +658,13 @@ EOF
       and .title == "Bold Task"
       and .body_excerpt == "Bold body survives."
       and .report_path == "data/bold-task/report.md"
+      and .report_present == true
   ' >/dev/null || fail "bold in-flight backlog row did not parse"
+  printf '%s' "$out" | jq -e '
+    .backlog.records[] | select(.id == "reported-comma")
+    | .report_path == "data/reported-comma/report.md"
+      and .report_present == false
+  ' >/dev/null || fail "missing canonical report was presented as available"
   printf '%s' "$out" | jq -e '
     .backlog.records[] | select(.id == "queued-comma")
     | .repo == "beta" and .since == "2026-07-08"
@@ -948,6 +1060,31 @@ test_parked_scout_decision_stays_pending() {
   pass "a scout still parked at a decision stays pending (terminal clear does not over-fire)"
 }
 
+test_unknown_pane_preserves_open_decision() {
+  local home fakebin out
+  home=$(make_home unknown-pane-decision)
+  mkdir -p "$home/projects/unknown-pane"
+  fm_write_meta "$home/state/unknown-pane.meta" \
+    "window=firstmate:fm-unknown-pane" \
+    "worktree=$home/projects/unknown-pane" \
+    "project=firstmate" \
+    "harness=claude" \
+    "kind=ship" \
+    "mode=ship"
+  printf 'needs-decision [key=route]: choose a route\n' > "$home/state/unknown-pane.status"
+  fakebin=$(make_fakebin "$home")
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    .tasks[] | select(.id == "unknown-pane")
+    | .current_state.state == "unknown"
+      and .current_state.source == "pane"
+      and .hints.pending_decision == true
+      and (.hints.open_decisions | length) == 1
+      and .hints.open_decisions[0].key == "route"
+  ' >/dev/null || fail "an uncertain pane read erased an open decision: $out"
+  pass "an uncertain pane read preserves an open decision"
+}
+
 # Home-summary validity treats persistent secondmates as registered homes, not
 # in-flight children. They have no backlog rows, so they must not produce
 # unowned_current or terminal_in_flight. Ordinary crew/ship metas still do.
@@ -1047,6 +1184,8 @@ EOF
 
 test_empty_fleet_json
 test_fixture_snapshot_json
+test_home_summary_preserves_held_report_availability
+test_home_summary_preserves_nonterminal_child_generations
 test_home_summary_excludes_secondmate_from_child_inventory
 test_undated_captain_hold_phrasing_and_aging
 test_hold_buckets_are_total_and_text_blind
@@ -1059,6 +1198,7 @@ test_open_decision_transfers_to_captain_hold
 test_open_decision_clears_on_keyed_resolution
 test_completed_scout_report_is_pointer_not_pending
 test_parked_scout_decision_stays_pending
+test_unknown_pane_preserves_open_decision
 test_scout_reports_include_teardown_reports
 test_backlog_tasks_axi_forms_and_overrides
 test_view_renders_snapshot
